@@ -4,12 +4,97 @@
 
 package akka.remote.artery.compress
 
+import java.util.concurrent.atomic.AtomicReference
+import java.util.function.LongFunction
+
+import scala.concurrent.duration.{ Duration, FiniteDuration }
+
 import akka.actor.{ ActorRef, ActorSystem, Address }
 import akka.event.{ Logging, NoLogging }
 import akka.remote.artery.{ InboundContext, OutboundContext }
 import akka.util.{ OptionVal, PrettyDuration }
-import scala.concurrent.duration.{ Duration, FiniteDuration }
-import java.util.concurrent.atomic.AtomicReference
+import org.agrona.collections.Long2ObjectHashMap
+
+/**
+ * INTERNAL API
+ * Decompress and cause compression advertisements.
+ *
+ * One per inbound message stream thus must demux by originUid to use the right tables.
+ */
+private[remote] trait InboundCompressions {
+  def hitActorRef(originUid: Long, remote: Address, ref: ActorRef, n: Int): Unit
+  def decompressActorRef(originUid: Long, tableVersion: Int, idx: Int): OptionVal[ActorRef]
+  def confirmActorRefCompressionAdvertisement(originUid: Long, tableVersion: Int): Unit
+
+  def hitClassManifest(originUid: Long, remote: Address, manifest: String, n: Int): Unit
+  def decompressClassManifest(originUid: Long, tableVersion: Int, idx: Int): OptionVal[String]
+  def confirmClassManifestCompressionAdvertisement(originUid: Long, tableVersion: Int): Unit
+}
+
+/**
+ * INTERNAL API
+ *
+ * One per incoming Aeron stream, actual compression tables are kept per-originUid and created on demand.
+ */
+private[remote] final class InboundCompressionsImpl(
+  system: ActorSystem,
+  inboundContext: InboundContext) extends InboundCompressions {
+
+  private val settings = CompressionSettings(system)
+
+  // FIXME we also must remove the ones that won't be used anymore - when quarantine triggers
+  private[this] val _actorRefsIns = new Long2ObjectHashMap[InboundActorRefCompression]()
+  private val createInboundActorRefsForOrigin = new LongFunction[InboundActorRefCompression] {
+    override def apply(originUid: Long): InboundActorRefCompression = {
+      val actorRefHitters = new TopHeavyHitters[ActorRef](settings.actorRefs.max)
+      new InboundActorRefCompression(system, settings, originUid, inboundContext, actorRefHitters)
+    }
+  }
+  private def actorRefsIn(originUid: Long): InboundActorRefCompression =
+    _actorRefsIns.computeIfAbsent(originUid, createInboundActorRefsForOrigin)
+
+  private[this] val _classManifestsIns = new Long2ObjectHashMap[InboundManifestCompression]()
+  private val createInboundManifestsForOrigin = new LongFunction[InboundManifestCompression] {
+    override def apply(originUid: Long): InboundManifestCompression = {
+      val manifestHitters = new TopHeavyHitters[String](settings.manifests.max)
+      new InboundManifestCompression(system, settings, originUid, inboundContext, manifestHitters)
+    }
+  }
+  private def classManifestsIn(originUid: Long): InboundManifestCompression =
+    _classManifestsIns.computeIfAbsent(originUid, createInboundManifestsForOrigin)
+
+  // actor ref compression ---
+
+  override def decompressActorRef(originUid: Long, tableVersion: Int, idx: Int): OptionVal[ActorRef] =
+    actorRefsIn(originUid).decompress(tableVersion, idx)
+  override def hitActorRef(originUid: Long, address: Address, ref: ActorRef, n: Int): Unit =
+    actorRefsIn(originUid).increment(address, ref, n)
+  override def confirmActorRefCompressionAdvertisement(originUid: Long, tableVersion: Int): Unit =
+    actorRefsIn(originUid).confirmAdvertisement(tableVersion)
+
+  // class manifest compression ---
+
+  override def decompressClassManifest(originUid: Long, tableVersion: Int, idx: Int): OptionVal[String] =
+    classManifestsIn(originUid).decompress(tableVersion, idx)
+  override def hitClassManifest(originUid: Long, address: Address, manifest: String, n: Int): Unit =
+    classManifestsIn(originUid).increment(address, manifest, n)
+  override def confirmClassManifestCompressionAdvertisement(originUid: Long, tableVersion: Int): Unit =
+    actorRefsIn(originUid).confirmAdvertisement(tableVersion)
+
+  // testing utilities ---
+
+  /** INTERNAL API: for testing only */
+  private[remote] def runNextActorRefAdvertisement() = {
+    import scala.collection.JavaConverters._
+    _actorRefsIns.values().asScala.foreach { inbound ⇒ inbound.runNextTableAdvertisement() }
+  }
+
+  /** INTERNAL API: for testing only */
+  private[remote] def runNextClassManifestAdvertisement() = {
+    import scala.collection.JavaConverters._
+    _classManifestsIns.values().asScala.foreach { inbound ⇒ inbound.runNextTableAdvertisement() }
+  }
+}
 
 /**
  * INTERNAL API
@@ -20,11 +105,11 @@ import java.util.concurrent.atomic.AtomicReference
  * If the association is not complete - we simply dont advertise the table, which is fine (handshake not yet complete).
  */
 private[remote] final class InboundActorRefCompression(
-  system:         ActorSystem,
-  settings:       CompressionSettings,
-  originUid:      Long,
+  system: ActorSystem,
+  settings: CompressionSettings,
+  originUid: Long,
   inboundContext: InboundContext,
-  heavyHitters:   TopHeavyHitters[ActorRef]) extends InboundCompression[ActorRef](system, settings, originUid, inboundContext, heavyHitters) {
+  heavyHitters: TopHeavyHitters[ActorRef]) extends InboundCompression[ActorRef](system, settings, originUid, inboundContext, heavyHitters) {
 
   preAllocate(system.deadLetters)
 
@@ -47,11 +132,11 @@ private[remote] final class InboundActorRefCompression(
 }
 
 final class InboundManifestCompression(
-  system:         ActorSystem,
-  settings:       CompressionSettings,
-  originUid:      Long,
+  system: ActorSystem,
+  settings: CompressionSettings,
+  originUid: Long,
   inboundContext: InboundContext,
-  heavyHitters:   TopHeavyHitters[String]) extends InboundCompression[String](system, settings, originUid, inboundContext, heavyHitters) {
+  heavyHitters: TopHeavyHitters[String]) extends InboundCompression[String](system, settings, originUid, inboundContext, heavyHitters) {
 
   scheduleNextTableAdvertisement()
   override protected def tableAdvertisementInterval = settings.manifests.advertisementInterval
@@ -77,9 +162,9 @@ private[remote] object InboundCompression {
   }
 
   final case class State[T](
-    oldTable:                DecompressionTable[T],
-    activeTable:             DecompressionTable[T],
-    nextTable:               DecompressionTable[T],
+    oldTable: DecompressionTable[T],
+    activeTable: DecompressionTable[T],
+    nextTable: DecompressionTable[T],
     advertisementInProgress: Option[CompressionTable[T]]) {
 
     def startUsingNextTable(): State[T] =
@@ -97,15 +182,15 @@ private[remote] object InboundCompression {
  * Handles counting and detecting of heavy-hitters and compressing them via a table lookup.
  */
 private[remote] abstract class InboundCompression[T >: Null](
-  val system:       ActorSystem,
-  val settings:     CompressionSettings,
-  originUid:        Long,
-  inboundContext:   InboundContext,
+  val system: ActorSystem,
+  val settings: CompressionSettings,
+  originUid: Long,
+  inboundContext: InboundContext,
   val heavyHitters: TopHeavyHitters[T]) {
 
   lazy val log = Logging(system, getClass.getSimpleName)
 
-  // TODO NOTE: there exist edge cases around, we advertise table 1, accumulate table 2, the remote system has not used 2 yet,
+  // FIXME NOTE: there exist edge cases around, we advertise table 1, accumulate table 2, the remote system has not used 2 yet,
   // yet we technically could already prepare table 3, then it starts using table 1 suddenly. Edge cases like that.
   // SOLUTION 1: We don't start building new tables until we've seen the previous one be used (move from new to active)
   //             This is nice as it practically disables all the "build the table" work when the other side is not interested in using it.
